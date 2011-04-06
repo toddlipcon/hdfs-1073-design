@@ -16,30 +16,84 @@
 \maketitle
 \tableofcontents
 
+\section{Transaction IDs}
+
+HDFS has had the concept of a transaction ID used inside {\tt FSEditLog} for a long time.
+Transaction IDs are assigned sequentially to threads as they write data into the log. They
+are then used to facilitate group commit during {\tt logSync()}.
+
+\subsection{Persistent Transaction IDs}
+
+One of the subtasks of HDFS-1073 is HDFS-1521, which makes the transaction IDs persist
+across restarts of the NameNode. That is to say, the first edit on a newly formatted
+NN will have transaction ID 1, and that ID will never be reused for the lifetime of
+the namesystem (even after restarts and checkpoints).
+
+\subsection{Non-namespace transactions}
+
+{\tt FSEditLog} already contains a couple of {\em special} transactions which do not correspond
+to actual modifications of the filesystem namespace, but instead are used to inform the
+BackupNode when the primary NameNode's logs are rolled, etc. We plan to add the following
+special transactions:
+
+\begin{enumerate}
+\item {\tt OP\_BEGIN\_LOG\_SEGMENT} - this transaction is written at the start of every new
+edit log file. It currently contains no data, but may later contain some special checkpointing
+information or metadata about the namespace.
+\item {\tt OP\_END\_LOG\_SEGMENT} - this transaction is written at the end of an edit log
+before it is closed. This is used as a sanity check that the log was gracefully closed, and
+is also useful to allow the BackupNode to synchronize its log roll with the primary NameNode.
+In the future it might be extended to include some kind of checksum information about the log
+file.
+\end{enumerate}
+
+These two special transactions also serve another purpose: they ensure that all edit logs
+contain at least one transaction. This avoids having to add many special case code-paths
+for empty edits files.
+
 \section{Storage contents}
 
-The NN storage directories continue to be organized in the same way - either edits, images, or both. The difference is that each edits or {\tt fsimage} file now has a suffix indicating its "roll index". For example, a newly formatted NN has the following contents:
+The NN storage directories continue to be organized in the same way - either edits, images, or both.
+The difference is that each edits or {\tt fsimage} file now has a suffix indicating the transaction IDs
+contained in the file.
+
+Files within a storage directory will have a name matching one of the following patterns:
+
+\begin{itemize}
+\item {\tt fsimage\_N} - this is a namesystem checkpoint that reflects all transactions
+up to and including transaction ID $N$.
+\item {\tt edits\_inprogress\_N} - this is an edit log whose first transaction has transaction
+ID $N$ and whose last transaction ID is unknown. This is the case for the log that is currently
+being written to by an active NameNode, or a previous NameNode that was shutdown uncleanly.
+\item {\tt edits\_N-M} - this is an edit log whose first transaction is $N$ and whose last
+transaction is $M$. It contains all transactions with identifier between $N$ and $M$ inclusive.
+\end{itemize}
+
+For example, a newly formatted NN has the following contents:
 
 \begin{enumerate}
 \item {\tt fsimage\_0} - empty image
-\item {\tt edits\_0\_inprogress} - the edit log currently being appended
+\item {\tt edits\_inprogress\_1} - the edit log currently being appended
 \end{enumerate}
 
-When edits are rolled, the current {\tt edits\_N\_inprogress} file is ``finalized'' by renaming to simply {\tt edits\_N}. So, if we roll the edits of the above image, we end up with:
+When edits are rolled, the current {\tt edits\_inprogress} file is ``finalized'' by renaming to {\tt edits\_N-M}.
+So, if we roll the edits of the above image after making 10 edits, we end up with:
 
 \begin{enumerate}
 \item {\tt fsimage\_0} - same empty image
-\item {\tt edits\_0} - any edits made before the roll
-\item {\tt edits\_1\_inprogress} - the edit log currently being appended
+\item {\tt edits\_1-10} - any edits made before the roll
+\item {\tt edits\_inprogress\_11} - the edit log currently being appended
 \end{enumerate}
 
-When an image is saved or uploaded via a checkpoint, the validity rule is as follows: any {\tt fsimage} with roll index N must incorporate all edits from logs with a roll index less than N. So, if we enter safe mode and call {\tt saveNamespace} on the above example, we end up with:
+When an image is saved or uploaded via a checkpoint, the validity rule is as follows:
+any {\tt fsimage} with txid $N$ must incorporate all edits from logs containing earlier transaction IDs.
+So, if we enter safe mode and call {\tt saveNamespace} on the above example, we end up with:
 \begin{enumerate}
 \item  {\tt fsimage\_0} - original empty imagge
-\item  {\tt edits\_0} - edits before first roll
-\item  {\tt edits\_1} - edits before {\tt saveNamespace}
-\item  {\tt fsimage\_2} - all edits from {\tt edits\_0} and {\tt edits\_1}
-\item  {\tt edits\_2\_inprogress} - the edit log where new edits will be appended
+\item  {\tt edits\_1-10} - edits before first roll
+\item  {\tt edits\_11-12} - edit log containing special {\tt BEGIN\_LOG\_SEGMENT} and {\tt END\_LOG\_SEGMENT} transactions but no actual namespace changes.
+\item  {\tt fsimage\_12} - all edits from both edit logs have bee incorporated into namespace
+\item  {\tt edits\_inprogress\_13} - the edit log where new edits will be appended
 \end{enumerate}
 
 \section{Log Rolling}
@@ -51,17 +105,17 @@ The following events can trigger a log roll:
 \item NN startup (see below)
 \item {\tt saveNamespace}
 \item a secondary or backup node wants to begin a checkpoint
-\item an IOException has occurred on one of the current edit logs
+\item a storage directory that had previously failed becomes available
 \item potentially we may find it useful to expose this as an admin function? (eg mysql offers a {\tt FLUSH LOGS} command, useful for backups)
 \end{enumerate}
 
 \subsection{Log rolling process}
 
 \begin{enumerate}
-\item The current {\tt edits\_N\_inprogress} log is closed
-\item The current {\tt edits\_N\_inprogress} log is renamed to {\tt edits\_N} in all valid edits directories.
-\item Any edits directories that previously had problems will be left with {\tt edits\_N\_inprogress} (since we don't know whether all of the edits made it into that log before the roll, in fact they probably did not)
-\item The next {\tt edits\_N+1\_inprogress} is opened in all directories, including an attempt to reopen any failed directories.
+\item The current {\tt edits\_inprogress\_N} log is closed
+\item The current {\tt edits\_inprogress\_N} log is renamed to {\tt edits\_N-M} in all valid edits directories.
+\item Any edits directories that previously had problems will be left with {\tt edits\_inprogress\_N} (since we don't know whether all of the edits made it into that log before the roll -- in fact they probably did not)
+\item The next {\tt edits\_inprogress\_M+1} is opened in all directories, including an attempt to reopen any failed directories.
 \end{enumerate}
 
 \section{Startup behavior}
@@ -69,16 +123,15 @@ The following events can trigger a log roll:
 \subsection{Log recovery (primary NN)}\label{logrecovery}
 First we initiate log recovery:
 \begin{enumerate}
-  \item Across all edits directories, look for any {\tt edits\_N\_inprogress}.
-  \item For each N for which we located {\tt edits\_N\_inprogress}:
+  \item Across all edits directories, look for any {\tt edits\_inprogress\_N}.
+  \item For each N for which we located {\tt edits\_inprogress\_N}:
   \begin{enumerate}
-    \item Look for a finalized {\tt edits\_N} in any other log directory
-    \item If there is at least one finalized {\tt edits\_N,} then the {\tt edits\_N\_inprogress} is likely corrupt – rename it to {\tt edits\_N\_corrupt} (or delete it if we are less cautious)
-    \item If there are no finalized {\tt edits\_N} files, then the NN crashed while we were writing log index N. Initiate recovery process across all {\tt edits\_N\_inprogress}
+    \item Look for any finalized edits file starting with the same transaction ID $N$ in any other log directory
+    \item If there is at least one finalized {\tt edits\_N-M,} then the {\tt edits\_inprogress\_N} is likely corrupt – rename it to {\tt edits\_inprogress\_N\_corrupt} (or delete it if we are less cautious)
+    \item If there are no finalized {\tt edits\_N-M} files, then the NN crashed while we were writing log index N. Initiate recovery process across all {\tt edits\_N\_inprogress}
     \begin{enumerate}
-      \item  Currently this isn't fancy - I just pick one. However, we could scan each of the logs for OP\_INVALID and find the longest one, ensure that they have the same length, etc (eg one log must not have caught the last edit, or been truncated, etc)
-      \item  This is very simple to do since across all directories (including secondaries) {\tt edits\_M} for any M should be identical!
-      \item  After we've determined the correct log(s), finalize it and remove the others
+      \item  For each log, calculate the ``valid length'' of the file - ie the length of the file after subtracting any trailing {\tt \\x00 bytes}
+      \item  After we've determined the longest log, use that one when replaying logs.
     \end{enumerate}
   \end{enumerate}
 \end{enumerate}
@@ -99,16 +152,19 @@ After performing the above recovery actions, we must determine which files to lo
 
 \begin{enumerate}
 \item Find the {\tt fsimage\_N} with the highest N across all image directories.
-\item Then, find the {\tt edits\_M} with the highest M across all edits directories.
-\item For safety, we check that there exists an {\tt edits\_X} for all X between N and M inclusive.
+\item Then, find all log files that start with a txid greater than $N$.
+\item Group all log files by their starting txid.
+\item {\bf Invariant:} all log files that start with the same txid should end with the same txid.
+\item {\bf Invariant:} if there is a log group for txid $N$ through $M$, then that is either the last log group, or the next group starts at txid $M+1$.
 \end{enumerate}
 
 We then start up the NN by the following sequence:
 \begin{enumerate}
 \item load {\tt fsimage\_N}
-\item for each N through M inclusive, load {\tt edits\_N}
-\item if we loaded any edits, save {\tt fsimage\_N+1}
-\item open {\tt edits\_inprogress\_N+1}
+\item Load any log from log group starting at $N+1$ (which ends at $M$)
+\item Load any log from log group starting at $M+1$
+\item ...etc...
+\item open {\tt edits\_inprogress\_Q} where Q is one transaction higher than the ending transaction of the last log group.
 \end{enumerate}
 
 \subsection{Upgrade}
@@ -123,46 +179,47 @@ The process for the primary NN to save its own namespace is:
 
 \begin{enumerate}
 \item NN must be in safe mode (this quiesces any incoming edits to the namesystem)
-\item NN rolls its own edit log - call the pre-roll log index $N$, so {\tt edits\_N} is finalized and {\tt edits\_N+1\_inprogress} just got opened.
-\item NN saves its namespace into {\tt fsimage\_ckpt\_N+1} in each edit directory.
-\item NN renames {\tt fsimage\_ckpt\_N+1} to {\tt fsimage\_N+1} in all edit directories.
+\item NN ends the currently open in-progress log segment by writing {\tt OP\_END\_SEGMENT} and renaming the file to finalize it.
+Let $N$ be the transaction ID for the {\tt OP\_END\_SEGMENT} transaction.
+\item NN saves its namespace into {\tt fsimage\_ckpt\_N} in each edit directory.
+\item NN renames {\tt fsimage\_ckpt\_N} to {\tt fsimage\_N} in all edit directories.
+\item NN opens {\tt edits\_inprogress\_N+1} in all log directories and writes {\tt OP\_BEGIN\_SEGMENT}.
 \end{enumerate}
 
 \subsection{Failure analysis}
 
 \begin{itemize}
-\item If the NN crashes after rolling edit logs, the old edit log is finalized and the new index is in progress. Log recovery proceeds as in section \ref{logrecovery} on restart - the pre-roll logs are loaded as if there was no failure.
-\item If the NN crashes while saving its namespace, image recovery will remove the incomplete {\tt ckpt} image.
-\item If the NN crashes after it has renamed one more of the new images, it will recover from that image and correctly ignore the {\tt edits} files with lower roll indexes.
+\item If the NN crashes after ending the prior segment but before saving the namespace,
+the old edit log is finalized but the new log has not been created.
+Log recovery proceeds as in section \ref{logrecovery} on restart.
+\item If the NN crashes while saving its namespace, image recovery will remove the incomplete {\tt ckpt} image, and recovery is the same as above.
+\item If the NN crashes after it has renamed one more of the new images, it will recover from that image and correctly ignore the {\tt edits} files with lower transaction IDs.
 \end{itemize}
-
-\subsection{Support for concurrent checkpoints}
-
-If a secondary NN initiates a checkpoint while {\tt saveNamespace} is under way, the checkpoint will cause another edit log roll. Therefore, when the secondary uploads its checkpoint, it will have a different index number than the image being saved by {\tt saveNamespace} and not conflict in any way.
 
 \section{Checkpoint process}
 \label{2nn-checkpoint}
 \begin{enumerate}
-\item {\tt CheckpointSignature} is modified to include the latest image index and the current log index in progress.
+\item {\tt CheckpointSignature} is modified to include the transaction ID associated with the latest {\tt fsimage} file as well as the starting transaction ID of the currently in-progress edit log.
 \item Checkpointing node issues {\tt beginCheckpoint} RPC to NN.
-\item NN rolls edit logs, and returns a checkpoint signature that includes the index N of latest stored {\tt fsimage\_N}, as well as the index of the most recent finalized log file.
+\item NN rolls edit logs, and returns a checkpoint signature as defined above.
+\item Secondary NameNode issues an RPC {\tt getRemoteEditLogs} to fetch the list of finalized log segments in between the image transaction ID and the current log segment's transaction ID.
 \item Image transfer servlet is augmented to allow the downloader to specify which image or edits file to download.
-\item Checkpointer downloads {\tt fsimage\_N} and {\tt edits\_N} through {\tt edits\_M} (where M is the latest edit roll index, from the checkpoint signature)
+\item Checkpointer downloads {\tt fsimage\_N} and and all edits files containing transactions between $N$ and the transaction ID specified in the checkpoint signature.
   \begin{itemize}
-  \item When each file is downloaded, it is initially written to {\tt edits\_inprogress\_N} or {\tt fsimage\_ckpt\_N} until it is verified. Once it is verified it can be renamed to the final destination {\tt edits\_N} or {\tt fsimage\_N}.
+  \item When each file is downloaded, it is initially written to {\tt edits\_inprogress\_N-M} or {\tt fsimage\_ckpt\_N} until it is verified. Once it is verified it can be renamed to the final destination {\tt edits\_N} or {\tt fsimage\_N}.
   \end{itemize}
  
-\item Checkpointer saves local {\tt fsimage\_M+1}, and uploads to NN
+\item Checkpointer saves local {\tt fsimage\_M}, and uploads to NN
   \begin{itemize}
   \item Similar to above, when the NN receives a new fsimage, it initially saves it as {\tt fsimage\_ckpt\_N} until the upload is complete. This prevents an aborted checkpoint from causing a corrupt storage directory.
   \end{itemize}
-\item NN validation of the checkpoint signature is much simpler - just needs to make sure it came from the same filesystem, check any security tokens, etc. The old fstime and editstime constructs are no longer necessary since it's all encapsulated in the index numbers. For extra safety we can easily add some checksum or log length info to the CheckpointSignature
+\item NN validation of the checkpoint signature is much simpler - just needs to make sure it came from the same filesystem, check any security tokens, etc. The old fstime and editstime constructs are no longer necessary since it's all encapsulated in the transaction IDs. For extra safety we can use the MD5 functionality from HDFS-903 as well.
 \item NN saves {\tt fsimage\_M+1} into its local image dirs, but does not need to do any log manipulation.
 \end{enumerate}
 
 \subsection{Handling multiple secondary name nodes}
 
-Note that in the above process there is no state stored on the NN with regard to ongoing checkpoint processes. If multiple checkpoint nodes checkpoint simultaneously, the NN will simply roll twice and hand a different index to each. Each will then upload fsimages with different indexes.
+Note that in the above process there is no state stored on the NN with regard to ongoing checkpoint processes. If multiple checkpoint nodes checkpoint simultaneously, the NN will simply roll twice and hand a different checkpoint transaction ID to each. Each will then upload fsimages with different associated txids.
 
 
 \section{BackupNode operation}
@@ -179,8 +236,7 @@ The BN maintains the following pieces of state:
   \item {\tt IN\_SYNC} specifies that the BN's namespace is currently up to date with the primary NN, and any edits received should be immediately applied to the namespace, in addition to being logged to disk.
   \item {\tt JOURNAL} specifies that the BN's namespace is currently behind the primary NN, and edits should only be written to disk.
   \end{itemize}
-\item {\tt namesystemReflectsLogsThrough} - the index of the last log for which the BN has completely applied edits.
-\item {\tt currentReceivingLog} - the index of the log that we're currently receiving from the primary NN
+\item {\tt namesystemReflectsLogsThroughTxId} - the index of the txid for which the BN has applied edits.
 \item {\tt stopApplyingAtNextRoll} - a boolean allowing the checkpoint code to pause application of edit records (see section \ref{stopApplyingAtNextRoll})
 \end{itemize}
 
@@ -189,9 +245,9 @@ The BN maintains the following pieces of state:
 On startup, the BackupNode first performs storage recovery as described in section \ref{bnrecovery}.
 It will then proceed with namespace reconstruction (see section \ref{ns-reconstruction}) in the same manner as if it were a primary NN.
 
-When startup is complete, The {\tt namesystemReflectsLogsThrough} variable will be up to date with the index of the latest log or image that the BN has recovered.
+When startup is complete, The {\tt namesystemReflectsLogsThroughTxId} variable will be up to date with the txid of the latest log or image that the BN has recovered.
 
-The BN then registers itself with the primary NN, which begins sending it edits. Upon registration, the NN rolls its edit log and begins streaming edits to the BN with the new log index.
+The BN then registers itself with the primary NN, which begins sending it edits. Upon registration, the NN rolls its edit log and begins streaming edits to the BN starting with the new log.
 
 The BN starts out in {\tt JOURNAL} mode, since it is not up to date with the current NN. In order to attain synchronization after startup, it may call {\tt catchupSynchronization} (see section \ref{catchupSynchronization}).
 
@@ -201,7 +257,12 @@ Once registered, the NN streams all edits to the BN via RPC as in the existing d
 
 \subsubsection{Special edit records}
 
-In addition to sending namesystem edits to the BN, the NN will also send a special {\tt OP\_ROLL\_LOGS} record which indicates that the primary NN has rolled its logs to a new index. This record includes the new index of the edit logs, so that the BN can update the {\tt currentReceivingLog} variable and roll its own logs. Additionally, if the flag {\tt stopApplyingAtNextRoll} this record will transition from {\tt IN\_SYNC} to {\tt JOURNAL} mode.\label{stopApplyingAtNextRoll}
+
+The {\tt OP\_BEGIN\_LOG\_SEGMENT} and {\tt OP\_END\_LOG\_SEGMENT} transactions are picked up by the BackupNode just like any other
+transaction, and cause it to roll its local edit logs to stay in sync with the primary NameNode.
+
+If {\tt stopApplyingAtNextRoll} is set, and the BN receives {\tt OP\_END\_LOG\_SEGMENT}, then the BN will transition from {\tt IN\_SYNC} into
+{\tt JOURNAL} mode. That is to say, from that transaction on, edits will only be logged and not applied to the namespace.
 
 \subsubsection{Applying and journaling edits}
 
@@ -218,21 +279,20 @@ In order to make a checkpoint, the BN takes the following steps:
 
 \begin{enumerate}
 \item Set {\tt stopApplyingAtNextRoll} flag.
-\item Ask NN to {\tt beginCheckpoint}, which rolls logs - this triggers {\tt OP\_ROLL\_LOGS} which pushes us to {\tt JOURNAL} state.
-\item We assert that BN's logs are now rolled and we are in {\tt JOURNAL} state. As in section \ref{2nn-checkpoint} we receive the index of the newly finalized edits log from the master as a response to {\tt beginCheckpoint}.
-\item If BN was previously {\tt IN\_SYNC} then we should already be up to date with the NN. If BN was not {\tt IN\_SYNC} then we download and apply edit logs between {\tt namesystemReflectsLogsThrough} and the index referenced by the {\tt CheckpointSignature}.
+\item Ask NN to {\tt beginCheckpoint}, which rolls logs - this triggers {\tt OP\_END\_LOG\_SEGMENT} which pushes us to {\tt JOURNAL} state.
+\item We assert that BN's logs are now closed and we are in {\tt JOURNAL} state. As in section \ref{2nn-checkpoint} we receive a CheckpointSignature as a response to {\tt beginCheckpoint}.
+\item If BN was previously {\tt IN\_SYNC} then we should already be up to date with the NN. If BN was not {\tt IN\_SYNC} then we download and apply edit logs between {\tt namesystemReflectsLogsThroughTxId} and the transaction ID referenced by the {\tt CheckpointSignature}.
 \item Checkpoint image is uploaded as in section \ref{2nn-checkpoint}.
 \item {\tt catchupSynchronization} is called (see section \ref{catchupSynchronization}).
 \end{enumerate}
 
-\subsection{Converging logs}
+\subsection{Converging logs (TODO need to update this design for txid)}
 
 After a checkpoint, we are in the {\tt JOURNAL} state and need to ``catch back up'' to the primary NN. The algorithm to do so is in pseudocode:
 \label{catchupSynchronization}
 \begin{verbatim}
 def catchupSynchronization():
   assert we are in JOURNAL state
-  assert currentReceivingLog != -1  [ ie that NN is sending us edits and we are journaling them ]
   converged = false
   while namesystemReflectsLogsThrough <= currentReceivingLog:
     if namesystemReflectsLogsThrough < currentReceivingLog:
@@ -268,14 +328,14 @@ def tryConverge(N):
 
 \subsection{Handling multiple BNs}
 
-In the above design, the BN never assumes that the NN will be stop rolling for any period of time. All checkpoint operations are stateless with respect to the server. If multiple BNs start checkpoints separately, they will checkpoint different roll indexes, and upload fsimage files with different indexes as well.
+In the above design, the BN never assumes that the NN will be stop rolling for any period of time. All checkpoint operations are stateless with respect to the server. If multiple BNs start checkpoints separately, they will checkpoint at different transaction IDs, and upload fsimage files with different txids as well.
 
 \section{Image/edits file retention policies}
 
 There are a number of policies that should be simple to implement:
 \begin{enumerate}
-\item {\bf Number of saved images} - ensure that we have at least N saved images in our image directories, can delete any that are more than N versions old. Maintain edit lots that have index $>=$ the index of the Nth oldest image.
-\item {\bf Time} - ensure that we maintain all images within a trailing time window - again maintain all edit logs with index $>=$ index of oldest maintained image.
+\item {\bf Number of saved images} - ensure that we have at least N saved images in our image directories, can delete any that are more than N versions old. Maintain edit lots that have starting txid $>=$ the txid of the Nth oldest image.
+\item {\bf Time} - ensure that we maintain all images within a trailing time window - again maintain all edit logs with txids $>=$ the txid of the oldest maintained image.
 \item {\bf Archival} - for audit purposes, the deletion mechanism could very easily be augmented to archive the edit logs for later analysis (eg to HDFS, tape, SAN, etc)
 \end{enumerate}
 
@@ -285,7 +345,7 @@ Although we do not plan to implement the following ideas within the scope of thi
 
 \subsection{NN-triggered checkpointing}
 
-Rather than having the BN trigger checkpoints on a periodic basis, it would be very simple to modify the design so that the BN triggers checkpoints based on a special flag on {\tt OP\_ROLL\_EDITS}.
+Rather than having the BN trigger checkpoints on a periodic basis, it would be very simple to modify the design so that the BN triggers checkpoints based on a special flag on {\tt OP\_END\_LOG\_SEGMENT}.
 
 \subsection{Offline Checkpointing}
 
@@ -294,7 +354,7 @@ Rather than having a special daemon to perform checkpointing, it may be nice to 
 This can be done as follows:
 \begin{enumerate}
 \item Read the {\tt fsimage\_N} with the highest N
-\item Read any {\tt edits\_M} for $M >= N$.
+\item Read any finalized {\tt edits} files containing txids higher than N.
 \item Save {\tt fsimage\_M} into the same directory.
 \end{enumerate}
 
@@ -304,18 +364,11 @@ In order to prevent collisions with other checkpointers, we need exclusive write
 
 \subsection{Shared storage for metadata}
 
-One of the primary advantages to the design in this document is that for any finalized edits or image file name, the contents of that file should be exactly identical across an entire cluster, including NNs, 2NNs, or BNs. In the current design, the primary and backup nodes communicate only by transfering complete files back and forth. For example, {\tt edits\_3} on the NN is fetched into the same name {\tt edits\_3} on the BN or 2NN.
+One of the primary advantages to the design in this document is that for any finalized edits or image file name, the contents of that file should be exactly identical across an entire cluster, including NNs, 2NNs, or BNs. In the current design, the primary and backup nodes communicate only by transfering complete files back and forth. For example, {\tt edits\_1000-2000} on the NN is fetched into the same name {\tt edits\_1000-2000} on the BN or 2NN.
 
-  To switch to a shared storage directory, the {\tt TransferFsImage} calls would essentially be replaced by no-ops. The BN would be modified to tail the current {\tt edits\_inprogress} file from the shared edits directory, and the NN can simply write the {\tt OP\_LOG\_ROLL} record into the end of that file when it has completed it. When the BN encounters this record, it simply opens the next log file in sequence to continue tailing edits.
+  To switch to a shared storage directory, the {\tt TransferFsImage} calls would essentially be replaced by no-ops. The BN would be modified to tail the current {\tt edits\_inprogress} file from the shared edits directory. When the BN encounters the {\tt OP\_END\_LOG\_SEGMENT} record, it simply opens the next log file in sequence to continue tailing edits.
 
-\section{Sequential vs Transaction-numbered edits}
-
-This document proposes that edit logs and images are numbered sequentially, with the first file being {\tt \{edits,image\}\_0} and proceeding to {\tt \_1}, {\tt \_2}, etc. An alternative design that has been proposed is to keep a transaction ID for each edit performed to the namesystem. The files would then be numbered as follows:
-\begin{itemize}
-\item {\tt fsimage\_T} indicates that the transaction with id $T$ was the {\em last} transaction applied to the namesystem before the image was saved.
-\item {\tt edits\_T} indicates that the {\em first} transaction stored in this edit log will have id $T$.
-\end{itemize}
-
+This is similar to the current design of the AvatarNode, except that it requires no coordination between checkpoints and the avatar.
 
 \section{Test Plan}
 
