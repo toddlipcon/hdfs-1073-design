@@ -153,7 +153,7 @@ After performing the above recovery actions, we must determine which files to lo
 \begin{enumerate}
 \item Find the {\tt fsimage\_N} with the highest N across all image directories.
 \item Then, find all log files that start with a txid greater than $N$.
-\item Group all log files by their starting txid.
+\item Group all log files across the log directories by their starting txid.
 \item {\bf Invariant:} all log files that start with the same txid should end with the same txid.
 \item {\bf Invariant:} if there is a log group for txid $N$ through $M$, then that is either the last log group, or the next group starts at txid $M+1$.
 \end{enumerate}
